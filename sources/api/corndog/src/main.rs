@@ -46,6 +46,20 @@ struct KernelSettings {
     sysctl: Option<HashMap<SysctlKey, String>>,
 }
 
+/// Trait for executing system commands
+trait CommandExecutor {
+    fn execute(&self, cmd: &str) -> std::io::Result<std::process::ExitStatus>;
+}
+
+/// Real command executor that runs actual system commands
+struct SystemCommandExecutor;
+
+impl CommandExecutor for SystemCommandExecutor {
+    fn execute(&self, cmd: &str) -> std::io::Result<std::process::ExitStatus> {
+        process::Command::new(cmd).status()
+    }
+}
+
 /// Main entry point.
 fn run() -> Result<()> {
     let args = parse_args(env::args());
@@ -96,36 +110,46 @@ where
     toml::from_str(config_str.as_str()).context(error::DeserializationSnafu)
 }
 
-/// Applies the requested sysctls to the system by writing them to a config file and using systemd-sysctl.
-/// The keys are used to generate the appropriate path, and the value its contents.
-fn set_sysctls<K>(sysctls: HashMap<K, String>) -> Result<()>
+/// Generate sysctl config file content from key-value pairs
+fn generate_sysctl_config<K>(sysctls: &HashMap<K, String>) -> String
 where
     K: AsRef<str>,
 {
-    // Build the sysctl config file content
     let mut config_content = String::new();
     for (key, value) in sysctls {
         let key = key.as_ref();
         config_content.push_str(&format!("{} = {}\n", key, value.trim()));
     }
+    config_content
+}
 
+/// Write sysctl config to a file, using a temporary file and atomic rename
+fn persist_sysctl_config(
+    config_content: &str,
+    config_dir: &str,
+    config_filename: &str,
+) -> Result<PathBuf> {
     // Create a temporary file in the sysctl config directory
-    let tempfile = NamedTempFile::new_in(SYSCTL_CONFIG_DIR).context(error::CreateTempFileSnafu {
-        path: PathBuf::from(SYSCTL_CONFIG_DIR),
+    let tempfile = NamedTempFile::new_in(config_dir).context(error::CreateTempFileSnafu {
+        path: PathBuf::from(config_dir),
     })?;
 
     // Write the config to the temporary file
     fs::write(tempfile.path(), config_content).context(error::WriteTempFileSnafu)?;
 
     // Construct the final path and atomically move the temporary file to it
-    let config_path = Path::new(SYSCTL_CONFIG_DIR).join(SYSCTL_CONFIG_FILENAME);
+    let config_path = Path::new(config_dir).join(config_filename);
     tempfile.persist(&config_path).context(error::PersistTempFileSnafu {
-        path: config_path,
+        path: config_path.clone(),
     })?;
 
-    // Run systemd-sysctl to apply the changes
-    let status = process::Command::new(SYSTEMD_SYSCTL_BIN)
-        .status()
+    Ok(config_path)
+}
+
+/// Apply sysctl settings using the given systemd-sysctl binary
+fn apply_sysctl_config(systemd_sysctl_bin: &str, executor: &dyn CommandExecutor) -> Result<()> {
+    let status = executor
+        .execute(systemd_sysctl_bin)
         .context(error::RunSystemdSysctlSnafu)?;
 
     if !status.success() {
@@ -134,6 +158,17 @@ where
 
     debug!("Successfully applied sysctl settings");
     Ok(())
+}
+
+/// Applies the requested sysctls to the system by writing them to a config file and using systemd-sysctl.
+/// The keys are used to generate the appropriate path, and the value its contents.
+fn set_sysctls<K>(sysctls: HashMap<K, String>) -> Result<()>
+where
+    K: AsRef<str>,
+{
+    let config_content = generate_sysctl_config(&sysctls);
+    persist_sysctl_config(&config_content, SYSCTL_CONFIG_DIR, SYSCTL_CONFIG_FILENAME)?;
+    apply_sysctl_config(SYSTEMD_SYSCTL_BIN, &SystemCommandExecutor)
 }
 
 /// Generate the hugepages setting for defaults.
@@ -381,9 +416,101 @@ type Result<T> = std::result::Result<T, error::Error>;
 
 #[cfg(test)]
 mod test {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use tempfile::TempDir;
     use test_case::test_case;
 
-    use super::*;
+    /// Mock command executor for testing
+    struct MockCommandExecutor {
+        success: bool,
+    }
+
+    impl MockCommandExecutor {
+        fn new(success: bool) -> Self {
+            Self { success }
+        }
+    }
+
+    impl CommandExecutor for MockCommandExecutor {
+        fn execute(&self, _cmd: &str) -> std::io::Result<std::process::ExitStatus> {
+            Ok(ExitStatus::from_raw(if self.success { 0 } else { 1 }))
+        }
+    }
+
+    // Helper to create a temporary directory for testing
+    fn setup_test_dir() -> TempDir {
+        TempDir::new().expect("Failed to create temp directory")
+    }
+
+    #[test]
+    fn test_generate_sysctl_config() {
+        let mut sysctls = HashMap::new();
+        sysctls.insert("net.ipv4.ip_forward", "1".to_string());
+        sysctls.insert("vm.swappiness", "60".to_string());
+        sysctls.insert("kernel.pid_max", "4194304 ".to_string()); // Note the trailing space
+
+        let config = generate_sysctl_config(&sysctls);
+
+        // Split into lines and sort for consistent comparison
+        let mut lines: Vec<&str> = config.lines().collect();
+        lines.sort();
+
+        assert_eq!(
+            lines,
+            vec![
+                "kernel.pid_max = 4194304",
+                "net.ipv4.ip_forward = 1",
+                "vm.swappiness = 60"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_generate_sysctl_config_empty() {
+        let sysctls: HashMap<String, String> = HashMap::new();
+        let config = generate_sysctl_config(&sysctls);
+        assert_eq!(config, "");
+    }
+
+    #[test]
+    fn test_persist_sysctl_config() {
+        let temp_dir = setup_test_dir();
+        let config = "net.ipv4.ip_forward = 1\nvm.swappiness = 60\n";
+        let filename = "test-sysctl.conf";
+
+        let config_path = persist_sysctl_config(
+            config,
+            temp_dir.path().to_str().unwrap(),
+            filename,
+        ).unwrap();
+
+        // Verify the config file was written correctly
+        let written_config = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(written_config, config);
+    }
+
+    #[test]
+    fn test_persist_sysctl_config_invalid_dir() {
+        let config = "net.ipv4.ip_forward = 1\n";
+        let result = persist_sysctl_config(config, "/nonexistent", "test.conf");
+        assert!(matches!(result, Err(error::Error::CreateTempFile { .. })));
+    }
+
+    #[test]
+    fn test_apply_sysctl_config_success() {
+        let executor = MockCommandExecutor::new(true);
+        let result = apply_sysctl_config(SYSTEMD_SYSCTL_BIN, &executor);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_sysctl_config_failure() {
+        let executor = MockCommandExecutor::new(false);
+        let result = apply_sysctl_config(SYSTEMD_SYSCTL_BIN, &executor);
+        assert!(matches!(result, Err(error::Error::SystemdSysctlFailed { .. })));
+    }
 
     #[test]
     fn brackets() {
