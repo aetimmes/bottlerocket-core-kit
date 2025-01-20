@@ -8,7 +8,7 @@ corndog also provides a settings generator for hugepages, subcommand "generate-h
 */
 
 use bottlerocket_modeled_types::{Lockdown, SysctlKey};
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use simplelog::{Config as LogConfig, LevelFilter, SimpleLogger};
 use snafu::ResultExt;
@@ -18,10 +18,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::string::String;
 use std::{env, process};
+use tempfile::NamedTempFile;
 
-const SYSCTL_PATH_PREFIX: &str = "/proc/sys";
 const LOCKDOWN_PATH: &str = "/sys/kernel/security/lockdown";
 const DEFAULT_CONFIG_PATH: &str = "/etc/corndog.toml";
+const SYSCTL_CONFIG_DIR: &str = "/etc/sysctl.d";
+const SYSCTL_CONFIG_FILENAME: &str = "95-corndog.conf";
+const SYSTEMD_SYSCTL_BIN: &str = "/usr/lib/systemd/systemd-sysctl";
 const NR_HUGEPAGES_PATH_SYSCTL: &str = "/proc/sys/vm/nr_hugepages";
 /// Number of hugepages we will assign per core.
 /// See [`compute_hugepages_for_efa`] for more detail on the computation consideration.
@@ -56,7 +59,7 @@ fn run() -> Result<()> {
             let kernel = get_kernel_settings(args.config_path)?;
             if let Some(sysctls) = kernel.sysctl {
                 debug!("Applying sysctls: {:#?}", sysctls);
-                set_sysctls(sysctls);
+                set_sysctls(sysctls)?;
             }
         }
         "lockdown" => {
@@ -93,34 +96,44 @@ where
     toml::from_str(config_str.as_str()).context(error::DeserializationSnafu)
 }
 
-fn sysctl_path<S>(name: S) -> PathBuf
-where
-    S: AsRef<str>,
-{
-    let name = name.as_ref();
-    let mut path = PathBuf::from(SYSCTL_PATH_PREFIX);
-    path.extend(name.replace('.', "/").split('/'));
-    trace!("Path for {}: {}", name, path.display());
-    path
-}
-
-/// Applies the requested sysctls to the system.  The keys are used to generate the appropriate
-/// path, and the value its contents.
-fn set_sysctls<K>(sysctls: HashMap<K, String>)
+/// Applies the requested sysctls to the system by writing them to a config file and using systemd-sysctl.
+/// The keys are used to generate the appropriate path, and the value its contents.
+fn set_sysctls<K>(sysctls: HashMap<K, String>) -> Result<()>
 where
     K: AsRef<str>,
 {
+    // Build the sysctl config file content
+    let mut config_content = String::new();
     for (key, value) in sysctls {
         let key = key.as_ref();
-        let path = sysctl_path(key);
-        if let Err(e) = fs::write(path, value) {
-            // We don't fail because sysctl keys can vary between kernel versions and depend on
-            // loaded modules.  It wouldn't be possible to deploy settings to a mixed-kernel fleet
-            // if newer sysctl values failed on your older kernels, for example, and we believe
-            // it's too cumbersome to have to specify in settings which keys are allowed to fail.
-            error!("Failed to write sysctl value '{}': {}", key, e);
-        }
+        config_content.push_str(&format!("{} = {}\n", key, value.trim()));
     }
+
+    // Create a temporary file in the sysctl config directory
+    let tempfile = NamedTempFile::new_in(SYSCTL_CONFIG_DIR).context(error::CreateTempFileSnafu {
+        path: PathBuf::from(SYSCTL_CONFIG_DIR),
+    })?;
+
+    // Write the config to the temporary file
+    fs::write(tempfile.path(), config_content).context(error::WriteTempFileSnafu)?;
+
+    // Construct the final path and atomically move the temporary file to it
+    let config_path = Path::new(SYSCTL_CONFIG_DIR).join(SYSCTL_CONFIG_FILENAME);
+    tempfile.persist(&config_path).context(error::PersistTempFileSnafu {
+        path: config_path,
+    })?;
+
+    // Run systemd-sysctl to apply the changes
+    let status = process::Command::new(SYSTEMD_SYSCTL_BIN)
+        .status()
+        .context(error::RunSystemdSysctlSnafu)?;
+
+    if !status.success() {
+        error::SystemdSysctlFailedSnafu { status }.fail()?;
+    }
+
+    debug!("Successfully applied sysctl settings");
+    Ok(())
 }
 
 /// Generate the hugepages setting for defaults.
@@ -301,6 +314,7 @@ fn main() {
 mod error {
     use snafu::Snafu;
     use std::io;
+    use std::path::PathBuf;
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(super)))]
@@ -334,6 +348,33 @@ mod error {
 
         #[snafu(display("Logger setup error: {}", source))]
         Logger { source: log::SetLoggerError },
+
+        #[snafu(display("Failed to create temporary file in {}: {}", path.display(), source))]
+        CreateTempFile {
+            path: PathBuf,
+            source: io::Error,
+        },
+
+        #[snafu(display("Failed to write sysctl config to temporary file: {}", source))]
+        WriteTempFile {
+            source: io::Error,
+        },
+
+        #[snafu(display("Failed to move temporary file to {}: {}", path.display(), source))]
+        PersistTempFile {
+            path: PathBuf,
+            source: tempfile::PersistError,
+        },
+
+        #[snafu(display("Failed to run systemd-sysctl: {}", source))]
+        RunSystemdSysctl {
+            source: io::Error,
+        },
+
+        #[snafu(display("systemd-sysctl failed with exit code: {}", status))]
+        SystemdSysctlFailed {
+            status: std::process::ExitStatus,
+        },
     }
 }
 type Result<T> = std::result::Result<T, error::Error>;
@@ -343,14 +384,6 @@ mod test {
     use test_case::test_case;
 
     use super::*;
-
-    #[test]
-    fn no_traversal() {
-        assert_eq!(
-            sysctl_path("../../root/file").to_string_lossy(),
-            format!("{}/root/file", SYSCTL_PATH_PREFIX)
-        );
-    }
 
     #[test]
     fn brackets() {
