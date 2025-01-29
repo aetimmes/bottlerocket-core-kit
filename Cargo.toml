@@ -42,7 +42,6 @@ members = [
   "packages/kexec-tools",
   "packages/keyutils",
   "packages/kmod",
-  "packages/kubernetes-1.24",
   "packages/kubernetes-1.25",
   "packages/kubernetes-1.26",
   "packages/kubernetes-1.27",
