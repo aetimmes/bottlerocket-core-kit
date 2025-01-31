@@ -5,8 +5,12 @@ std = { version = "v1", helpers = ["if_not_null"] }
 {{#if_not_null settings.bootstrap-containers}}
 {{#each settings.bootstrap-containers}}
 ["{{@key}}"]
+{{#if_not_null this.source}}
 source = "{{{this.source}}}"
+{{/if_not_null}}
+{{#if_not_null this.mode}}
 mode = "{{{this.mode}}}"
+{{/if_not_null}}
 {{#if_not_null this.user-data}}
 user-data = "{{{this.user-data}}}"
 {{/if_not_null}}
